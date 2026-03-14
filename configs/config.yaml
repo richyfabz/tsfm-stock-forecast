@@ -1,0 +1,35 @@
+data:
+  tickers: ["GOOG", "TSLA", "SPY"]
+  period: "2y"
+  interval: "1d"
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+
+model:
+  context_length: 60
+  d_model: 64
+  nhead: 4
+  num_layers: 2
+  dropout: 0.1
+
+chronos:
+  model_name: "amazon/chronos-t5-small"
+  prediction_length: 20
+  device: "cpu"
+  num_samples: 20
+  context_length: 60
+
+training:
+  epochs: 20
+  batch_size: 32
+  learning_rate: 0.0001
+  val_split: 0.15
+  test_split: 0.15
+  early_stopping_patience: 5
+  model_save_path: "models/"
+
+evaluation:
+  output_dir: "outputs/"
+
+cli:
+  default_ticker: "GOOG"
