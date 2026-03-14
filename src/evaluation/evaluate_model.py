@@ -6,6 +6,9 @@ import matplotlib.dates as mdates
 import os
 import yaml
 import sys
+from rich.console import Console
+from rich.table import Table
+from rich import box
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -241,6 +244,37 @@ def plot_chronos_forecast(ticker: str, config: dict):
     plt.close()
     print(f"  Chart saved → {path}")
 
+def load_lstm(config: dict):
+    sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
+    from src.models.lstm_model import build_lstm
+    model = build_lstm(config)
+    path  = os.path.join(config["training"]["model_save_path"], "best_lstm.pt")
+    model.load_state_dict(torch.load(path, map_location="cpu"))
+    model.eval()
+    print(f"  LSTM loaded from {path}")
+    return model
+
+
+def evaluate_lstm(config: dict):
+    """Evaluate LSTM on test set and return metrics + predictions."""
+    processed_dir = config["data"]["processed_dir"]
+    X_test = np.load(os.path.join(processed_dir, "X_test.npy"))
+    y_test = np.load(os.path.join(processed_dir, "y_test.npy"))
+
+    model  = load_lstm(config)
+    X_tensor = torch.tensor(X_test, dtype=torch.float32)
+
+    with torch.no_grad():
+        y_pred = model(X_tensor).numpy()
+
+    metrics = compute_metrics(y_test, y_pred)
+
+    print("\nLSTM Evaluation Metrics")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}")
+
+    return metrics, y_test, y_pred
+
 def evaluate(config: dict):
     output_dir = config["evaluation"]["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
@@ -264,6 +298,52 @@ def evaluate(config: dict):
     plot_close_price(config, model, output_dir)
 
     print(f"\n✓ Evaluation complete. Charts saved → {output_dir}")
+
+    # --- Side by side comparison ---
+    transformer_metrics = compute_metrics(y_test, y_pred)
+    lstm_metrics = evaluate_lstm(config)[0]  # Get LSTM metrics
+
+    console = Console()
+    table   = Table(
+        title="Model Comparison — Test Set",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold cyan",
+        title_style="bold white",
+        padding=(0, 2)
+    )
+
+    table.add_column("Metric",               style="dim",         width=26)
+    table.add_column("Transformer",          style="bold green",  width=16, justify="center")
+    table.add_column("LSTM",                 style="bold yellow", width=16, justify="center")
+    table.add_column("Winner",               style="bold white",  width=14, justify="center")
+
+    metrics_to_compare = [
+        ("MAE",                   "MAE",                  True),   # lower is better
+        ("RMSE",                  "RMSE",                 True),   # lower is better
+        ("Directional Accuracy",  "Directional Accuracy", False),  # higher is better
+    ]
+
+    for label, key, lower_is_better in metrics_to_compare:
+        t_val = transformer_metrics[key]
+        l_val = lstm_metrics[key]
+
+        if lower_is_better:
+            winner = "🏆 Transformer" if t_val < l_val else "🏆 LSTM"
+        else:
+            winner = "🏆 Transformer" if t_val > l_val else "🏆 LSTM"
+
+        table.add_row(
+            label,
+            f"{t_val:.4f}",
+            f"{l_val:.4f}",
+            winner
+        )
+
+    console.print()
+    console.print(table)
+    console.print()
+    
     # --- Chronos 20-day forecast charts ---
     print("\nGenerating Chronos 20-day forecast charts...")
     for ticker in config["data"]["tickers"]:
