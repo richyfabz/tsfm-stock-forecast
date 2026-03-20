@@ -10,6 +10,7 @@ import yaml
 sys.path.append(os.path.dirname(__file__))
 
 from src.models.transformer_model import build_model
+from src.models.lstm_model import build_lstm
 from src.models.chronos_model import (
     load_chronos, get_context, run_forecast, build_forecast_df
 )
@@ -25,7 +26,7 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────
-# LOAD CONFIG
+# CONFIG
 # ─────────────────────────────────────────────
 @st.cache_resource
 def load_config():
@@ -34,7 +35,7 @@ def load_config():
 
 
 # ─────────────────────────────────────────────
-# LOAD MODELS (cached — runs once)
+# MODEL LOADERS (cached — runs once each)
 # ─────────────────────────────────────────────
 @st.cache_resource
 def get_chronos(_config):
@@ -42,7 +43,7 @@ def get_chronos(_config):
 
 
 @st.cache_resource
-def get_scratch_model(_config):
+def get_transformer(_config):
     model = build_model(_config)
     path  = os.path.join(_config["training"]["model_save_path"], "best_model.pt")
     model.load_state_dict(torch.load(path, map_location="cpu"))
@@ -50,11 +51,20 @@ def get_scratch_model(_config):
     return model
 
 
+@st.cache_resource
+def get_lstm(_config):
+    model = build_lstm(_config)
+    path  = os.path.join(_config["training"]["model_save_path"], "best_lstm.pt")
+    model.load_state_dict(torch.load(path, map_location="cpu"))
+    model.eval()
+    return model
+
+
 # ─────────────────────────────────────────────
-# COMPUTE FORECASTS (cached per ticker)
+# DATA HELPERS
 # ─────────────────────────────────────────────
 @st.cache_data
-def get_forecast(ticker: str, _config, _pipeline):
+def fetch_chronos_forecast(ticker: str, _config, _pipeline):
     context, last_close, last_date, history_dates = get_context(ticker, _config)
     forecast_raw = run_forecast(_pipeline, context, _config)
     forecast_df  = build_forecast_df(
@@ -65,55 +75,8 @@ def get_forecast(ticker: str, _config, _pipeline):
 
 
 @st.cache_data
-def get_scratch_metrics(_config, _model):
-    processed_dir = _config["data"]["processed_dir"]
-    X_test = np.load(os.path.join(processed_dir, "X_test.npy"))
-    y_test = np.load(os.path.join(processed_dir, "y_test.npy"))
-    X_tensor = torch.tensor(X_test, dtype=torch.float32)
-    with torch.no_grad():
-        y_pred = _model(X_tensor).numpy()
-    mae     = float(np.mean(np.abs(y_test - y_pred)))
-    rmse    = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
-    dir_acc = float(np.mean(np.sign(y_test) == np.sign(y_pred)))
-    return {"mae": mae, "rmse": rmse, "dir_acc": dir_acc, "n_test": len(y_test)}
-
-@st.cache_resource
-def get_lstm_model(_config):
-    from src.models.lstm_model import build_lstm
-    model = build_lstm(_config)
-    path  = os.path.join(_config["training"]["model_save_path"], "best_lstm.pt")
-    model.load_state_dict(torch.load(path, map_location="cpu"))
-    model.eval()
-    return model
-
-
-@st.cache_data
-def get_lstm_metrics(_config, _model):
-    processed_dir = _config["data"]["processed_dir"]
-    X_test = np.load(os.path.join(processed_dir, "X_test.npy"))
-    y_test = np.load(os.path.join(processed_dir, "y_test.npy"))
-    X_tensor = torch.tensor(X_test, dtype=torch.float32)
-    with torch.no_grad():
-        y_pred = _model(X_tensor).numpy()
-    mae     = float(np.mean(np.abs(y_test - y_pred)))
-    rmse    = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
-    dir_acc = float(np.mean(np.sign(y_test) == np.sign(y_pred)))
-    return {"mae": mae, "rmse": rmse, "dir_acc": dir_acc, "n_test": len(y_test)}
-
-
-@st.cache_data
-def get_lstm_predictions(_config, _model):
-    processed_dir = _config["data"]["processed_dir"]
-    X_test = np.load(os.path.join(processed_dir, "X_test.npy"))
-    y_test = np.load(os.path.join(processed_dir, "y_test.npy"))
-    X_tensor = torch.tensor(X_test, dtype=torch.float32)
-    with torch.no_grad():
-        y_pred = _model(X_tensor).numpy()
-    return y_test, y_pred
-
-
-@st.cache_data
-def get_actual_vs_predicted(ticker: str, _config, _model):
+def fetch_scratch_predictions(ticker: str, _config, _model):
+    """Run scratch model (transformer or LSTM) on ticker test sequences."""
     processed_dir  = _config["data"]["processed_dir"]
     context_length = _config["model"]["context_length"]
     test_split     = _config["training"]["test_split"]
@@ -121,8 +84,10 @@ def get_actual_vs_predicted(ticker: str, _config, _model):
     feat_path = os.path.join(processed_dir, f"{ticker}_features.csv")
     df        = pd.read_csv(feat_path, index_col=0, parse_dates=True)
 
-    feature_cols = ["return", "log_return", "rsi", "macd",
-                    "macd_signal", "bb_width", "volume_ma_ratio", "close_ma_ratio"]
+    feature_cols = [
+        "return", "log_return", "rsi", "macd",
+        "macd_signal", "bb_width", "volume_ma_ratio", "close_ma_ratio"
+    ]
 
     n          = len(df)
     test_start = int(n * (1 - test_split))
@@ -146,7 +111,7 @@ def get_actual_vs_predicted(ticker: str, _config, _model):
             dates.append(df_test.index[i + 1])
 
     if not X_ticker:
-        return None, None, None
+        return None, None, None, None
 
     X_tensor = torch.tensor(np.array(X_ticker, dtype=np.float32))
     with torch.no_grad():
@@ -166,59 +131,28 @@ def get_actual_vs_predicted(ticker: str, _config, _model):
     pred_prices = pred_prices[-min_len:]
     actual      = close_test.reindex(dates).values
 
-    return dates, actual, pred_prices
+    # Metrics
+    y_true = np.array(actual)
+    y_pred = np.array(pred_prices)
+    mae    = float(np.mean(np.abs(y_true - y_pred)))
+    rmse   = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
-def chart_all_models(y_test, transformer_pred, lstm_pred):
-    """All models on one returns chart."""
-    fig = go.Figure()
+    # Directional accuracy on returns
+    X_test  = np.load(os.path.join(processed_dir, "X_test.npy"))
+    y_test  = np.load(os.path.join(processed_dir, "y_test.npy"))
+    Xt      = torch.tensor(X_test, dtype=torch.float32)
+    with torch.no_grad():
+        yp = _model(Xt).numpy()
+    dir_acc = float(np.mean(np.sign(y_test) == np.sign(yp)))
 
-    fig.add_trace(go.Scatter(
-        y=y_test, mode="lines", name="Actual Returns",
-        line=dict(color="#4C9BE8", width=1)
-    ))
-    fig.add_trace(go.Scatter(
-        y=transformer_pred, mode="lines", name="Transformer",
-        line=dict(color="orange", width=1, dash="dash")
-    ))
-    fig.add_trace(go.Scatter(
-        y=lstm_pred, mode="lines", name="LSTM",
-        line=dict(color="#2ecc71", width=1, dash="dot")
-    ))
+    metrics = {"mae": mae, "rmse": rmse, "dir_acc": dir_acc}
+    return dates, actual, pred_prices, metrics
 
-    fig.update_layout(
-        title="All Models — Actual vs Predicted Returns (Test Set)",
-        xaxis_title="Test Sample Index",
-        yaxis_title="Return",
-        hovermode="x unified", height=400,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        margin=dict(l=40, r=20, t=60, b=40),
-    )
-    return fig
-
-
-def chart_lstm_returns(y_test, y_pred):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        y=y_test, mode="lines", name="Actual",
-        line=dict(color="#4C9BE8", width=1)
-    ))
-    fig.add_trace(go.Scatter(
-        y=y_pred, mode="lines", name="LSTM Predicted",
-        line=dict(color="#2ecc71", width=1, dash="dash")
-    ))
-    fig.update_layout(
-        title="LSTM — Actual vs Predicted Returns (Test Set)",
-        xaxis_title="Test Sample Index", yaxis_title="Return",
-        hovermode="x unified", height=380,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        margin=dict(l=40, r=20, t=60, b=40),
-    )
-    return fig
 
 # ─────────────────────────────────────────────
-# CHART BUILDERS
+# CHARTS
 # ─────────────────────────────────────────────
-def chart_chronos(ticker, forecast_df, last_close, last_date, context, history_dates):
+def chart_chronos(ticker, forecast_df, last_close, last_date):
     raw_path = f"data/raw/{ticker}.csv"
     raw_df   = pd.read_csv(raw_path, index_col=0, parse_dates=True)
     if isinstance(raw_df.columns, pd.MultiIndex):
@@ -227,18 +161,12 @@ def chart_chronos(ticker, forecast_df, last_close, last_date, context, history_d
 
     fig = go.Figure()
 
-    # Historical
-    # Today line:using scatter trace for compatibility
     fig.add_trace(go.Scatter(
-        x=[last_date, last_date],
-        y=[history.values.min() * 0.98, history.values.max() * 1.02],
-        mode="lines",
-        name="Today",
-        line=dict(color="gray", width=1, dash="dot"),
-        showlegend=True
+        x=history.index, y=history.values,
+        mode="lines", name="Historical Close",
+        line=dict(color="#4C9BE8", width=2)
     ))
 
-    # 90% band
     fig.add_trace(go.Scatter(
         x=pd.concat([forecast_df["date"], forecast_df["date"][::-1]]),
         y=pd.concat([forecast_df["high_90"], forecast_df["low_90"][::-1]]),
@@ -247,16 +175,14 @@ def chart_chronos(ticker, forecast_df, last_close, last_date, context, history_d
         name="90% Confidence"
     ))
 
-    # 80% band
     fig.add_trace(go.Scatter(
         x=pd.concat([forecast_df["date"], forecast_df["date"][::-1]]),
         y=pd.concat([forecast_df["high_80"], forecast_df["low_80"][::-1]]),
-        fill="toself", fillcolor="rgba(255,165,0,0.20)",
+        fill="toself", fillcolor="rgba(255,165,0,0.22)",
         line=dict(color="rgba(255,255,255,0)"),
         name="80% Confidence"
     ))
 
-    # Median forecast
     fig.add_trace(go.Scatter(
         x=forecast_df["date"], y=forecast_df["median"],
         mode="lines+markers", name="Median Forecast",
@@ -264,18 +190,26 @@ def chart_chronos(ticker, forecast_df, last_close, last_date, context, history_d
         marker=dict(size=4)
     ))
 
+    fig.add_trace(go.Scatter(
+        x=[last_date, last_date],
+        y=[history.values.min() * 0.98, history.values.max() * 1.02],
+        mode="lines", name="Today",
+        line=dict(color="gray", width=1, dash="dot")
+    ))
+
     fig.update_layout(
-        title=f"{ticker} — Chronos T5 20-Day Forecast",
+        title=f"{ticker} — Chronos T5 20-Day Forecast with Confidence Intervals",
         xaxis_title="Date", yaxis_title="Price (USD)",
-        hovermode="x unified", height=420,
+        hovermode="x unified", height=450,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         margin=dict(l=40, r=20, t=60, b=40),
     )
     return fig
 
 
-def chart_actual_vs_predicted(ticker, dates, actual, predicted):
-    fig = go.Figure()
+def chart_scratch(ticker, dates, actual, predicted, model_name):
+    color = "orange" if model_name == "Transformer" else "#2ecc71"
+    fig   = go.Figure()
 
     fig.add_trace(go.Scatter(
         x=dates, y=actual,
@@ -285,14 +219,14 @@ def chart_actual_vs_predicted(ticker, dates, actual, predicted):
 
     fig.add_trace(go.Scatter(
         x=dates, y=predicted,
-        mode="lines", name="Predicted Close",
-        line=dict(color="orange", width=1.5, dash="dash")
+        mode="lines", name=f"{model_name} Predicted",
+        line=dict(color=color, width=1.5, dash="dash")
     ))
 
     fig.update_layout(
-        title=f"{ticker} — Actual vs Predicted Close (Test Set)",
+        title=f"{ticker} — {model_name}: Actual vs Predicted Close Price (Test Set)",
         xaxis_title="Date", yaxis_title="Price (USD)",
-        hovermode="x unified", height=380,
+        hovermode="x unified", height=420,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         margin=dict(l=40, r=20, t=60, b=40),
     )
@@ -302,135 +236,102 @@ def chart_actual_vs_predicted(ticker, dates, actual, predicted):
 # ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
-def render_sidebar(metrics):
+def render_sidebar(config):
     with st.sidebar:
         st.image("https://img.icons8.com/fluency/96/stock-share.png", width=60)
         st.title("TSFM Forecast")
-        st.caption("Powered by Chronos T5 + Custom Transformer")
+        st.caption("Powered by Chronos T5 + PyTorch")
         st.divider()
 
-        st.subheader("Scratch Transformer")
-        st.caption("Evaluated on held-out test set")
-        col1, col2 = st.columns(2)
-        col1.metric("MAE",  f"{metrics['mae']:.4f}")
-        col2.metric("RMSE", f"{metrics['rmse']:.4f}")
-        st.metric(
-            "Directional Accuracy",
-            f"{metrics['dir_acc']*100:.1f}%",
-            delta=f"{(metrics['dir_acc']-0.5)*100:+.1f}% vs random"
+        # Ticker selector
+        st.subheader("📊 Select Ticker")
+        ticker = st.selectbox(
+            "Stock",
+            options=config["data"]["tickers"],
+            format_func=lambda x: {
+                "GOOG": "GOOG — Alphabet Inc.",
+                "TSLA": "TSLA — Tesla Inc.",
+                "SPY":  "SPY  — S&P 500 ETF"
+            }.get(x, x)
         )
-        st.caption(f"Test samples: {metrics['n_test']}")
-        st.divider()
-
-        st.subheader("Models")
-        st.markdown("- **Chronos T5 Small** — Amazon (pretrained)")
-        st.markdown("- **StockTransformer** — Custom PyTorch (trained from scratch)")
-        st.markdown("- **LSTM** — Traditional sequential model (trained from scratch)")
 
         st.divider()
 
-        st.subheader("Tickers")
-        st.markdown("- **GOOG** — Alphabet Inc.")
-        st.markdown("- **TSLA** — Tesla Inc.")
-        st.markdown("- **SPY** — S&P 500 ETF")
+        # Model selector
+        st.subheader("🧠 Select Model")
+        model_choice = st.selectbox(
+            "Forecasting Model",
+            options=["Chronos T5", "Transformer", "LSTM"],
+            format_func=lambda x: {
+                "Chronos T5":  "Chronos T5 — Amazon (pretrained)",
+                "Transformer": "Transformer — Custom PyTorch",
+                "LSTM":        "LSTM — Traditional Sequential"
+            }.get(x, x)
+        )
+
         st.divider()
 
-        st.caption("For educational purposes only. Not financial advice.")
-
-def render_comparison(scratch_metrics, lstm_metrics):
-    st.subheader("🏆 Model Comparison")
-
-    # --- Metrics table ---
-    col1, col2, col3, col4 = st.columns(4)
-    col1.markdown("**Metric**")
-    col2.markdown("**Transformer**")
-    col3.markdown("** LSTM**")
-    col4.markdown("**Winner**")
-
-    metrics = [
-        ("MAE",                  "mae",     True),
-        ("RMSE",                 "rmse",    True),
-        ("Directional Accuracy", "dir_acc", False),
-    ]
-
-    for label, key, lower_is_better in metrics:
-        t_val = scratch_metrics[key]
-        l_val = lstm_metrics[key]
-
-        if lower_is_better:
-            t_color = "green" if t_val < l_val else "red"
-            l_color = "green" if l_val < t_val else "red"
-            winner  = "Transformer" if t_val < l_val else "🏆 LSTM"
+        # Model info card
+        if model_choice == "Chronos T5":
+            st.markdown("**About this model**")
+            st.markdown("""
+- Pretrained by Amazon on millions of time-series
+- Probabilistic — returns confidence intervals
+- 20-day multi-step forecast
+- Input: raw closing prices
+            """)
+        elif model_choice == "Transformer":
+            st.markdown("**About this model**")
+            st.markdown("""
+- Built from scratch with PyTorch
+- Self-attention across all 60 days
+- 102,657 trainable parameters
+- Input: 8 technical indicators
+            """)
         else:
-            t_color = "green" if t_val > l_val else "red"
-            l_color = "green" if l_val > t_val else "red"
-            winner  = "Transformer" if t_val > l_val else "🏆 LSTM"
+            st.markdown("**About this model**")
+            st.markdown("""
+- Traditional sequential architecture
+- Reads sequence step by step
+- 54,337 trainable parameters
+- Input: 8 technical indicators
+            """)
 
-        col1.markdown(label)
-        col2.markdown(f":{t_color}[{t_val:.4f}]")
-        col3.markdown(f":{l_color}[{l_val:.4f}]")
-        col4.markdown(winner)
+        st.divider()
+        st.caption("⚠️ For educational purposes only. Not financial advice.")
 
-    st.divider()
+        return ticker, model_choice
 
-    # --- Written comparison ---
-    st.markdown("####  Why Transformer Wins on Error Metrics")
-    st.markdown("""
-The **Transformer** achieves lower MAE and RMSE because its **self-attention mechanism**
-reads all 60 days of context simultaneously,directly connecting distant time steps
-without information decay. This gives it a more accurate picture of the overall
-price level and magnitude.
-
-The **LSTM** reads the sequence step-by-step, passing a hidden state forward at each step.
-By day 60, signals from day 1 have faded through the gate mechanism, a fundamental
-limitation called the **vanishing gradient problem** on long sequences.
-
-However, LSTM's slightly higher **Directional Accuracy** (54.9% vs 51.1%) suggests
-its sequential gate memory captures short-term momentum,the immediate "is the next
-move up or down?" signal,marginally better than the transformer on this dataset size.
-
-**Key insight:** With only ~1,200 training samples, the transformer's advantage is
-already visible. On larger datasets, the performance gap widens significantly in
-the transformer's favour.
-    """)
-    st.divider()
 
 # ─────────────────────────────────────────────
-# TICKER CARD
+# RENDER CHRONOS
 # ─────────────────────────────────────────────
-def render_ticker(ticker, config, pipeline, scratch_model):
-    forecast_df, last_close, last_date, context, history_dates = get_forecast(
+def render_chronos(ticker, config, pipeline):
+    forecast_df, last_close, last_date, context, _ = fetch_chronos_forecast(
         ticker, config, pipeline
     )
-    dates, actual, predicted = get_actual_vs_predicted(ticker, config, scratch_model)
 
-    # Summary metrics
     day1  = forecast_df.iloc[0]
     day20 = forecast_df.iloc[-1]
     overall_change = ((day20["median"] - last_close) / last_close) * 100
     day1_change    = ((day1["median"]  - last_close) / last_close) * 100
 
-    st.subheader(f"{'📈' if overall_change > 0 else '📉'} {ticker}")
-
+    # Summary metrics
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Last Close",      f"${last_close:.2f}")
-    m2.metric("Tomorrow",        f"${day1['median']:.2f}",
+    m1.metric("Last Close",       f"${last_close:.2f}")
+    m2.metric("Tomorrow",         f"${day1['median']:.2f}",
               delta=f"{day1_change:+.2f}%")
-    m3.metric("Day 20 Forecast", f"${day20['median']:.2f}",
+    m3.metric("Day 20 Forecast",  f"${day20['median']:.2f}",
               delta=f"{overall_change:+.2f}%")
     m4.metric("80% Range Day 20",
               f"${day20['low_80']:.0f} – ${day20['high_80']:.0f}")
 
-    # Tabs per ticker
-    tab1, tab2, tab3 = st.tabs([
-        "📅 20-Day Forecast Chart",
-        "📋 Forecast Table",
-        "🔁 Actual vs Predicted"
-    ])
+    # Tabs
+    tab1, tab2 = st.tabs(["📅 Forecast Chart", "📋 Forecast Table"])
 
     with tab1:
         st.plotly_chart(
-            chart_chronos(ticker, forecast_df, last_close, last_date, context, history_dates),
+            chart_chronos(ticker, forecast_df, last_close, last_date),
             use_container_width=True
         )
 
@@ -452,16 +353,53 @@ def render_ticker(ticker, config, pipeline, scratch_model):
         display_df["Change (%)"] = display_df["Change (%)"].map("{:+.2f}%".format)
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    with tab3:
-        if dates is not None:
-            st.plotly_chart(
-                chart_actual_vs_predicted(ticker, dates, actual, predicted),
-                use_container_width=True
-            )
-        else:
-            st.info("Not enough test data to generate this chart.")
 
-    st.divider()
+# ─────────────────────────────────────────────
+# RENDER SCRATCH MODEL (TRANSFORMER OR LSTM)
+# ─────────────────────────────────────────────
+def render_scratch(ticker, config, model, model_name):
+    dates, actual, predicted, metrics = fetch_scratch_predictions(
+        ticker, config, model
+    )
+
+    if dates is None:
+        st.warning("Not enough test data to generate forecast for this ticker.")
+        return
+
+    # Last known close
+    raw_path = os.path.join(config["data"]["raw_dir"], f"{ticker}.csv")
+    raw_df   = pd.read_csv(raw_path, index_col=0, parse_dates=True)
+    if isinstance(raw_df.columns, pd.MultiIndex):
+        raw_df.columns = raw_df.columns.get_level_values(0)
+    last_close = float(raw_df["Close"].iloc[-1])
+    last_pred  = predicted[-1]
+    pred_change = ((last_pred - last_close) / last_close) * 100
+
+    # Summary metrics
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Last Close",          f"${last_close:.2f}")
+    m2.metric("Latest Prediction",   f"${last_pred:.2f}",
+              delta=f"{pred_change:+.2f}%")
+    m3.metric("MAE",                 f"{metrics['mae']:.4f}")
+    m4.metric("Directional Accuracy",f"{metrics['dir_acc']*100:.1f}%")
+
+    # Chart
+    st.plotly_chart(
+        chart_scratch(ticker, dates, actual, predicted, model_name),
+        use_container_width=True
+    )
+
+    # Metrics expander
+    with st.expander("📐 Full Model Metrics"):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("MAE",                 f"{metrics['mae']:.4f}")
+        c2.metric("RMSE",                f"{metrics['rmse']:.4f}")
+        c3.metric("Directional Accuracy",f"{metrics['dir_acc']*100:.1f}%")
+        st.caption(
+            "MAE and RMSE measure prediction error on the held-out test set. "
+            "Directional Accuracy measures how often the model correctly "
+            "predicted whether the price would go up or down."
+        )
 
 
 # ─────────────────────────────────────────────
@@ -471,48 +409,43 @@ def main():
     config = load_config()
 
     # Header
-    st.title("📈 TSFM Stock Forecast Dashboard")
+    st.title("📈 TSFM Stock Forecast")
     st.caption(
-        "20-day probabilistic forecasts using **Chronos T5** (Amazon) "
-        "and a custom **Transformer** trained from scratch on GOOG, TSLA, SPY."
+        "Select a stock and a forecasting model from the sidebar to view predictions."
     )
     st.divider()
 
-    # Load models
-    with st.spinner("Loading Chronos T5..."):
-        pipeline = get_chronos(config)
+    # Sidebar — get user selections
+    ticker, model_choice = render_sidebar(config)
 
-    with st.spinner("Loading scratch transformer..."):
-        scratch_model = get_scratch_model(config)
+    # Load selected model
+    if model_choice == "Chronos T5":
+        with st.spinner("Loading Chronos T5..."):
+            pipeline = get_chronos(config)
+    elif model_choice == "Transformer":
+        with st.spinner("Loading Transformer..."):
+            model = get_transformer(config)
+    else:
+        with st.spinner("Loading LSTM..."):
+            model = get_lstm(config)
 
-    with st.spinner("Loading LSTM model..."):
-        lstm_model = get_lstm_model(config)
-
-    scratch_metrics = get_scratch_metrics(config, scratch_model)
-    lstm_metrics    = get_lstm_metrics(config, lstm_model)
-
-    # Sidebar
-    render_sidebar(scratch_metrics)
-
-    # Get predictions for both models on same test set
-    lstm_y_test, lstm_pred        = get_lstm_predictions(config, lstm_model)
-    _,           transformer_pred = get_lstm_predictions(config, scratch_model)
-
-    render_comparison(scratch_metrics, lstm_metrics)
-
-    # All models chart
-    st.subheader("📊 All Models on One Chart")
-    st.plotly_chart(
-        chart_all_models(lstm_y_test, transformer_pred, lstm_pred),
-        use_container_width=True
-    )
+    # Ticker + model header
+    ticker_names = {
+        "GOOG": "Alphabet Inc. (GOOG)",
+        "TSLA": "Tesla Inc. (TSLA)",
+        "SPY":  "S&P 500 ETF (SPY)"
+    }
+    st.subheader(f"{ticker_names[ticker]} — {model_choice}")
     st.divider()
 
-    # All 3 tickers
-    tickers = config["data"]["tickers"]
-    for ticker in tickers:
-        with st.spinner(f"Running forecast for {ticker}..."):
-            render_ticker(ticker, config, pipeline, scratch_model)
+    # Render selected model output
+    with st.spinner(f"Running {model_choice} forecast for {ticker}..."):
+        if model_choice == "Chronos T5":
+            render_chronos(ticker, config, pipeline)
+        elif model_choice == "Transformer":
+            render_scratch(ticker, config, model, "Transformer")
+        else:
+            render_scratch(ticker, config, model, "LSTM")
 
 
 if __name__ == "__main__":
